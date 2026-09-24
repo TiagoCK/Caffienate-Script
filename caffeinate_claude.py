@@ -31,7 +31,7 @@ PYTHON = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.execu
 PMSET = "/usr/bin/pmset"
 
 BATTERY_MIN_PERCENT = 15  # stop keeping awake at or below this (when discharging)
-MAX_HOURS = 4  # safety cap in case a Stop hook never fires
+MAX_HOURS = 2  # safety cap in case a Stop hook never fires
 BATTERY_CHECK_SECONDS = 60
 STARTUP_GRACE_SECONDS = 30  # a session is "active" this long before its pid appears
 
