@@ -7,6 +7,7 @@ closed on battery, then lets it sleep again as soon as the task is done.
   opens and runs `caffeinate -ims`. It also runs `pmset -a disablesleep 1`, which is the
   only thing that stops lid-close sleep on battery.
 - When Claude finishes, the script Ctrl+C's caffeinate, runs `pmset -a disablesleep 0`, and closes the window.
+  The same happens if Claude **hits a usage limit** or otherwise stops on an error.
 
 It runs automatically through Claude Code hooks, so it works in every Claude Code
 instance (CLI and desktop app).
@@ -19,7 +20,7 @@ instance (CLI and desktop app).
 python3 caffeinate_claude.py install
 ```
 
-This adds `UserPromptSubmit`, `Stop` and `SessionEnd` hooks to `~/.claude/settings.json`,
+This adds `UserPromptSubmit`, `Stop`, `StopFailure` and `SessionEnd` hooks to `~/.claude/settings.json`,
 using absolute paths, so keep the script where it is (or re-run `install` after moving it).
 `python3 caffeinate_claude.py uninstall` removes them.
 
@@ -57,8 +58,10 @@ Click **Allow**.
 | Trigger | What happens |
 |---|---|
 | Claude finishes (`Stop`) or the session ends (`SessionEnd`) | stops that session |
+| Claude hits a usage limit or another API error (`StopFailure`) | stops that session |
+| A usage-limit error shows up in the session transcript | stops by itself (backup in case `StopFailure` doesn't fire) |
 | Battery ≤ 15% and discharging | stops by itself |
-| 4 hours elapsed | stops by itself (in case a hook never fired) |
+| 2 hours elapsed | stops by itself (in case a hook never fired) |
 | You close the window or press Ctrl+C | stops and re-enables sleep |
 | Several Claude sessions at once | sleep is re-enabled only when the **last** one stops |
 

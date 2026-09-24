@@ -3,11 +3,15 @@
 
 Driven by Claude Code hooks:
     UserPromptSubmit -> start   (opens a Terminal window running caffeinate)
-    Stop / SessionEnd -> stop   (Ctrl+C's caffeinate and closes the window)
+    Stop / StopFailure / SessionEnd -> stop   (Ctrl+C's caffeinate, closes the window)
+
+StopFailure is what fires when a turn ends on an API error such as a usage limit.
+As a fallback, the window also watches the session transcript for a usage-limit error.
 
 Lid-closed-on-battery sleep can only be overridden with `pmset -a disablesleep 1`,
 which needs a passwordless sudoers rule (see README). Sleep is re-enabled as soon
-as the last active session stops, the battery gets low, or MAX_HOURS elapses.
+as the last active session stops, Claude hits a usage limit, the battery gets
+low, or MAX_HOURS elapses.
 
 Usage:
     caffeinate_claude.py start | stop [--all] | status | panic | install | uninstall
@@ -34,8 +38,14 @@ BATTERY_MIN_PERCENT = 15  # stop keeping awake at or below this (when dischargin
 MAX_HOURS = 2  # safety cap in case a Stop hook never fires
 BATTERY_CHECK_SECONDS = 60
 STARTUP_GRACE_SECONDS = 30  # a session is "active" this long before its pid appears
+TRANSCRIPT_CHECK_SECONDS = 10
 
-HOOK_EVENTS = {"UserPromptSubmit": "start", "Stop": "stop", "SessionEnd": "stop"}
+HOOK_EVENTS = {
+    "UserPromptSubmit": "start",
+    "Stop": "stop",
+    "StopFailure": "stop",  # turn ended on an API error (usage limit, etc.)
+    "SessionEnd": "stop",
+}
 
 
 # ---------------------------------------------------------------- helpers
@@ -46,15 +56,16 @@ def log(msg):
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
 
 
-def session_from_stdin():
-    """Hooks pass JSON on stdin; fall back to 'manual' when run by hand."""
-    if sys.stdin.isatty():
-        return "manual"
-    try:
-        data = json.loads(sys.stdin.read() or "{}")
-    except json.JSONDecodeError:
-        data = {}
-    return safe_id(data.get("session_id") or "manual")
+def hook_input():
+    """Hooks pass JSON on stdin; session_id falls back to 'manual' when run by hand."""
+    data = {}
+    if not sys.stdin.isatty():
+        try:
+            data = json.loads(sys.stdin.read() or "{}")
+        except json.JSONDecodeError:
+            pass
+    data["session_id"] = safe_id(data.get("session_id") or "manual")
+    return data
 
 
 def safe_id(sid):
@@ -160,12 +171,38 @@ def close_window(window_id):
 
 # ---------------------------------------------------------------- commands
 
-def cmd_start(sid):
+def usage_limit_hit(transcript, offset):
+    """Scan transcript lines appended after `offset` for a usage-limit error.
+
+    Returns (hit, new_offset). Only complete lines are consumed.
+    """
+    try:
+        with open(transcript, "rb") as f:
+            f.seek(offset)
+            chunk = f.read()
+    except OSError:
+        return False, offset
+    end = chunk.rfind(b"\n") + 1
+    for line in chunk[:end].splitlines():
+        if b"isApiErrorMessage" not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("isApiErrorMessage") and entry.get("error") == "rate_limit":
+            return True, offset + end
+    return False, offset + end
+
+
+def cmd_start(hook):
+    sid = hook["session_id"]
     if session_active(sid):
         return
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(meta_path(sid), "w") as f:
-        json.dump({"started": time.time(), "window_id": None}, f)
+        json.dump({"started": time.time(), "window_id": None,
+                   "transcript_path": hook.get("transcript_path")}, f)
 
     shell_cmd = f"exec {shlex.quote(PYTHON)} {shlex.quote(SCRIPT)} _window {shlex.quote(sid)}"
     window_id = osascript(
@@ -200,12 +237,21 @@ def cmd_window(sid):
     else:
         print("☕ caffeinate only — lid-close sleep NOT blocked on battery.\n"
               "   Set up the sudoers rule from the README to enable that.")
-    print(f"   Auto-stops when Claude finishes, battery ≤ {BATTERY_MIN_PERCENT}%, "
-          f"or after {MAX_HOURS}h.  Ctrl+C to stop now.", flush=True)
+    print(f"   Auto-stops when Claude finishes or hits a usage limit, "
+          f"battery ≤ {BATTERY_MIN_PERCENT}%, or after {MAX_HOURS}h.  "
+          f"Ctrl+C to stop now.", flush=True)
+
+    meta = read_json(meta_path(sid)) or {}
+    transcript = meta.get("transcript_path")
+    try:
+        transcript_offset = os.path.getsize(transcript) if transcript else 0
+    except OSError:
+        transcript_offset = 0
 
     caf = subprocess.Popen(["caffeinate", "-ims"])
     deadline = time.time() + MAX_HOURS * 3600
     next_battery_check = 0
+    next_transcript_check = 0
     reason = "stopped"
     try:
         while caf.poll() is None:
@@ -218,6 +264,12 @@ def cmd_window(sid):
                 pct, discharging = battery_status()
                 if discharging and pct is not None and pct <= BATTERY_MIN_PERCENT:
                     reason = f"battery low ({pct}%)"
+                    break
+            if transcript and now >= next_transcript_check:
+                next_transcript_check = now + TRANSCRIPT_CHECK_SECONDS
+                hit, transcript_offset = usage_limit_hit(transcript, transcript_offset)
+                if hit:
+                    reason = "Claude hit its usage limit"
                     break
             time.sleep(1)
         else:
@@ -233,9 +285,16 @@ def cmd_window(sid):
                 caf.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 caf.kill()
+        window_id = (read_json(meta_path(sid)) or meta).get("window_id")
         release(sid)
         log(f"{sid}: {reason}")
         print(f"\n😴 {reason} — sleep re-enabled.", flush=True)
+        # Close our own window once this process has exited (needed when we stop
+        # ourselves: usage limit, battery, cap). Harmless if `stop` closes it first.
+        if window_id:
+            subprocess.Popen([PYTHON, SCRIPT, "_close", str(window_id)],
+                             start_new_session=True, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def release(sid):
@@ -246,10 +305,12 @@ def release(sid):
         set_sleep_disabled(False)
 
 
-def cmd_stop(sid):
+def cmd_stop(sid, error=None):
     meta = read_json(meta_path(sid))
     if meta is None:
         return
+    if error:
+        log(f"{sid}: turn ended with API error: {error}")
     # A very short task can end before the window process has written its pid.
     for _ in range(30):
         pid = read_pid(sid)
@@ -345,16 +406,20 @@ def main():
     action = args[0] if args else "help"
     try:
         if action == "start":
-            cmd_start(session_from_stdin())
+            cmd_start(hook_input())
         elif action == "stop" and "--all" in args:
             cmd_stop_all()
         elif action == "stop":
-            cmd_stop(session_from_stdin())
+            hook = hook_input()
+            cmd_stop(hook["session_id"], hook.get("error"))
         elif action == "panic":
             cmd_stop_all()
             print("All sessions stopped; sleep re-enabled.")
         elif action == "_window":
             cmd_window(args[1])
+        elif action == "_close":
+            time.sleep(1)  # let the window's process finish exiting
+            close_window(args[1])
         elif action == "status":
             cmd_status()
         elif action == "install":
