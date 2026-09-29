@@ -3,10 +3,14 @@
 Keeps your Mac awake **only while Claude Code is working**, including with the lid
 closed on battery, then lets it sleep again as soon as the task is done.
 
-- When you send Claude a prompt, a Terminal window titled **☕ Claude is working**
-  opens and runs `caffeinate -ims`. It also runs `pmset -a disablesleep 1`, which is the
+- When you send Claude a prompt, a Terminal window titled **Claude is working**
+  opens **in the background** (focus goes straight back to the app you were using) and
+  runs `caffeinate -ims`. It also runs `pmset -a disablesleep 1`, which is the
   only thing that stops lid-close sleep on battery.
 - When Claude finishes, the script Ctrl+C's caffeinate, runs `pmset -a disablesleep 0`, and closes the window.
+- While Claude is **waiting on you** (a plan to approve, a question, or a permission
+  prompt), it pauses: caffeinate stops, the Mac may sleep, and the window shows
+  **Paused: waiting for your answer**. Keep-awake comes back as soon as you answer.
 - If Claude **hits a usage limit**, the Mac is allowed to sleep, a wake is scheduled for
   when the limit resets, and then Claude **resumes the task by itself** and the Mac stays
   awake until it's done. See [Usage limits](#usage-limits).
@@ -22,7 +26,9 @@ instance (CLI and desktop app).
 python3 caffeinate_claude.py install
 ```
 
-This adds `UserPromptSubmit`, `Stop`, `StopFailure` and `SessionEnd` hooks to `~/.claude/settings.json`,
+This adds `UserPromptSubmit`, `Stop`, `StopFailure`, `SessionEnd`, `PreToolUse`
+(`ExitPlanMode|AskUserQuestion`), `Notification` (`permission_prompt|elicitation_dialog`),
+`PostToolUse` and `PostToolUseFailure` hooks to `~/.claude/settings.json`,
 using absolute paths, so keep the script where it is (or re-run `install` after moving it).
 `python3 caffeinate_claude.py uninstall` removes them.
 
@@ -66,10 +72,11 @@ Click **Allow**.
 | Claude finishes (`Stop`) or the session ends (`SessionEnd`) | stops that session |
 | Claude hits a usage limit (`StopFailure`, or spotted in the transcript as a backup) | lets the Mac sleep until the reset, then resumes (see below) |
 | Claude stops on any other API error (`StopFailure`) | stops that session |
+| Claude is waiting on you: plan approval, a question, or a permission prompt | pauses (Mac may sleep) until you answer |
 | Battery ≤ 15% and discharging | stops by itself |
 | 2 hours awake | stops by itself (in case a hook never fired); counted per awake stretch |
 | You close the window or press Ctrl+C | stops and re-enables sleep |
-| Several Claude sessions at once | sleep is re-enabled only when the **last** one stops (or starts waiting) |
+| Several Claude sessions at once | sleep is re-enabled only when the **last** one stops (or pauses/waits) |
 
 The thresholds are constants at the top of `caffeinate_claude.py` (`BATTERY_MIN_PERCENT`, `MAX_HOURS`).
 
@@ -78,7 +85,7 @@ The thresholds are constants at the top of `caffeinate_claude.py` (`BATTERY_MIN_
 When a session hits its usage limit:
 
 1. The window stops caffeinate, turns sleep back on, and retitles itself
-   **💤 Usage limit — resuming at 1:21 PM**. The reset time comes from Claude Code's
+   **Usage limit — resuming at 1:21 PM**. The reset time comes from Claude Code's
    own record of the limit, and the resume is set for 90 seconds after it.
 2. It schedules a wake with `pmset schedule wake`, so the Mac wakes itself up.
 3. At that time it turns sleep off again, restarts caffeinate, and runs
@@ -121,7 +128,7 @@ Claude; it just wakes, logs, and stays up 60 seconds.
 python3 caffeinate_claude.py status
 ```
 
-Lists active and waiting sessions (with their resume time) and whether sleep is
+Lists active, paused and waiting sessions (with their resume time) and whether sleep is
 currently disabled. `pmset -g sched` shows scheduled wake-ups.
 
 ```bash

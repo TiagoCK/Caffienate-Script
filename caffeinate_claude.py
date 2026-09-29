@@ -2,8 +2,13 @@
 """Keep a Mac awake (even lid-closed on battery) only while Claude Code is working.
 
 Driven by Claude Code hooks:
-    UserPromptSubmit -> start   (opens a Terminal window running caffeinate)
+    UserPromptSubmit -> start   (opens a background Terminal window running caffeinate)
     Stop / StopFailure / SessionEnd -> stop   (Ctrl+C's caffeinate, closes the window)
+    PreToolUse(ExitPlanMode|AskUserQuestion), Notification(permission prompt) -> pause
+    PostToolUse / PostToolUseFailure -> resume
+
+While paused (a plan, question or permission prompt is waiting on you) caffeinate is
+stopped and the Mac may sleep; keep-awake comes back once you answer.
 
 If Claude hits its usage limit, the window lets the Mac sleep, schedules a wake for
 when the limit resets (`pmset schedule wake`), then resumes the session headlessly
@@ -53,12 +58,19 @@ CHILD_ENV = "CAFFEINATE_CLAUDE_CHILD"  # set for the resumed claude; its hooks n
 RESUME_PROMPT = ("Your usage limit has reset. Continue the task you were working on "
                  "from where you left off.")
 
-HOOK_EVENTS = {
-    "UserPromptSubmit": "start",
-    "Stop": "stop",
-    "StopFailure": "stop",  # turn ended on an API error (usage limit, etc.)
-    "SessionEnd": "stop",
-}
+# (event, matcher or None, action)
+HOOKS = [
+    ("UserPromptSubmit", None, "start"),
+    ("Stop", None, "stop"),
+    ("StopFailure", None, "stop"),  # turn ended on an API error (usage limit, etc.)
+    ("SessionEnd", None, "stop"),
+    # Waiting on you: a plan to approve, a question, or a permission prompt.
+    ("PreToolUse", "ExitPlanMode|AskUserQuestion", "pause"),
+    ("Notification", "permission_prompt|elicitation_dialog", "pause"),
+    # You answered and the tool ran (or was rejected/denied): back to work.
+    ("PostToolUse", None, "resume"),
+    ("PostToolUseFailure", None, "resume"),
+]
 
 
 # ---------------------------------------------------------------- helpers
@@ -153,12 +165,20 @@ def session_waiting(sid):
     return meta.get("state") == "waiting" and pid_alive(read_pid(sid))
 
 
+def session_state(sid):
+    """'working', 'paused' (waiting on you), 'waiting' (usage-limit reset), or None
+    if the session's window process isn't running."""
+    if not pid_alive(read_pid(sid)):
+        return None
+    return (read_json(meta_path(sid)) or {}).get("state", "working")
+
+
 def session_active(sid):
-    """Active = keeping the Mac awake: its window process is alive and not waiting
-    for a usage-limit reset, or it was started moments ago."""
+    """Active = keeping the Mac awake: its window process is alive and working
+    (not paused or waiting for a reset), or it was started moments ago."""
     meta = read_json(meta_path(sid)) or {}
     if pid_alive(read_pid(sid)):
-        return meta.get("state") != "waiting"
+        return meta.get("state", "working") == "working"
     return time.time() - meta.get("started", 0) < STARTUP_GRACE_SECONDS
 
 
@@ -321,7 +341,11 @@ def cmd_start(hook, extra=None):
     if session_waiting(sid):
         # You came back and typed before the reset: take over from the scheduled resume.
         log(f"{sid}: new prompt while waiting for reset; cancelling scheduled resume")
-        cmd_stop(sid, force=True)
+        cmd_stop(sid, force=True, reason="new prompt; scheduled resume cancelled")
+    elif session_state(sid) == "paused":
+        cmd_resume(sid, "new prompt")
+        update_meta(sid, **{k: hook[k] for k in ("cwd", "permission_mode") if k in hook})
+        return
     elif session_active(sid):
         # Keep what the resume needs current (permission mode can change mid-session).
         update_meta(sid, **{k: hook[k] for k in ("cwd", "permission_mode") if k in hook})
@@ -336,22 +360,62 @@ def cmd_start(hook, extra=None):
     })
 
     shell_cmd = f"exec {shlex.quote(PYTHON)} {shlex.quote(SCRIPT)} _window {shlex.quote(sid)}"
+    # Open the window, then hand focus straight back to whatever was in front, so the
+    # window stays open behind it. Terminal's previous front window is re-raised too:
+    # otherwise typing in Terminal (now or when you next switch to it) would land in,
+    # and garble, the new window.
     window_id = osascript(
         "on run argv",
+        "set prevApp to path to frontmost application as text",
+        "set inTerminal to prevApp ends with \"Terminal.app:\"",
         'tell application "Terminal"',
+        "set prevWin to missing value",
+        "if (count of windows) > 0 then set prevWin to id of front window",
         "do script (item 1 of argv)",
-        "return id of front window",
+        "set wid to id of front window",
+        "if prevWin is not missing value then set index of window id prevWin to 1",
         "end tell",
+        "if not inTerminal then",
+        "try",
+        "tell application prevApp to activate",
+        "end try",
+        "end if",
+        "return wid",
         "end run",
         args=[shell_cmd],
     )
     update_meta(sid, window_id=int(window_id) if window_id.isdigit() else None)
 
 
+def cmd_pause(sid, trigger):
+    """Claude is waiting on you: let the window process stop keeping the Mac awake."""
+    if session_state(sid) != "working":
+        return
+    if not (read_json(meta_path(sid)) or {}).get("pausable"):
+        return  # window started by an older version: SIGUSR2 would kill it
+    update_meta(sid, state="paused")
+    os.kill(read_pid(sid), signal.SIGUSR2)
+    log(f"{sid}: pause ({trigger})")
+
+
+def cmd_resume(sid, trigger):
+    """You answered: keep the Mac awake again. Fast no-op unless paused, since
+    PostToolUse fires on every tool call."""
+    if session_state(sid) != "paused":
+        return
+    update_meta(sid, state="working")
+    os.kill(read_pid(sid), signal.SIGUSR2)
+    log(f"{sid}: resume ({trigger})")
+
+
 class Watch:
     """Mutable state shared between the window loop and its signal handlers."""
 
-    def __init__(self, transcript):
+    def __init__(self, sid, transcript):
+        self.sid = sid
+        self.caf = None  # the running caffeinate, None while paused
+        self.title = "Claude is working"
+        self.state_changed = False  # set by SIGUSR2: pause/resume
         self.transcript = transcript
         try:
             self.offset = os.path.getsize(transcript) if transcript else 0
@@ -383,19 +447,44 @@ def stop_process(proc, sig=signal.SIGINT):
             proc.kill()
 
 
-def watch_working(w, caf, child=None):
+def apply_pause_state(w):
+    """Handle a SIGUSR2: stop or restart caffeinate to match the session state.
+    Returns True if keep-awake was (re)started."""
+    state = (read_json(meta_path(w.sid)) or {}).get("state")
+    if state == "paused" and w.caf is not None:
+        stop_process(w.caf)
+        w.caf = None
+        set_title("Paused: waiting for your answer")
+        if not others_active(w.sid):
+            set_sleep_disabled(False)
+        print("Paused: Claude is waiting on you — sleep allowed until you answer.", flush=True)
+    elif state == "working" and w.caf is None:
+        w.caf, _ = keep_awake(w.title)
+        print("Back to work — keeping awake.", flush=True)
+        return True
+    return False
+
+
+def watch_working(w, child=None):
     """Loop while Claude works. Returns ("limit", resets_at) or ("done", reason).
     The interactive case ends via SIGINT from the Stop hook (KeyboardInterrupt)."""
     deadline = time.time() + MAX_HOURS * 3600
     next_battery = next_transcript = 0
     while True:
         now = time.time()
+        if w.state_changed:
+            w.state_changed = False
+            if apply_pause_state(w):
+                deadline = now + MAX_HOURS * 3600  # time paused doesn't count
+        if w.caf is None:  # paused: nothing to watch until you answer
+            time.sleep(1)
+            continue
         if child is not None and child.poll() is not None:
             resets_at = w.limit() if w.transcript else None
             if resets_at is not None:
                 return "limit", resets_at
             return "done", f"resumed task finished (exit {child.returncode})"
-        if caf.poll() is not None:
+        if w.caf.poll() is not None:
             return "done", "caffeinate exited"
         if now >= deadline:
             return "done", f"reached {MAX_HOURS}h safety cap"
@@ -419,11 +508,11 @@ def wait_for_reset(sid, resets_at):
     """Let the Mac sleep until the limit resets; a scheduled wake gets us back."""
     wake_at = resets_at + WAKE_DELAY_SECONDS
     update_meta(sid, state="waiting", resets_at=resets_at, wake_at=wake_at)
-    set_title(f"💤 Usage limit — resuming at {fmt_time(wake_at)}")
+    set_title(f"Usage limit — resuming at {fmt_time(wake_at)}")
     if not others_active(sid):
         set_sleep_disabled(False)
     scheduled = schedule_wake(wake_at)
-    print(f"\n💤 Usage limit hit. Sleeping allowed; resuming at {fmt_time(wake_at)}.")
+    print(f"\nUsage limit hit. Sleeping allowed; resuming at {fmt_time(wake_at)}.")
     if not scheduled:
         print("   Couldn't schedule a wake (see README sudoers rule) — the resume "
               "will run the next time the Mac is awake after that.")
@@ -447,19 +536,24 @@ def cmd_window(sid):
     with open(pid_path(sid), "w") as f:
         f.write(str(os.getpid()))
     meta = read_json(meta_path(sid)) or {}
-    w = Watch(meta.get("transcript_path"))
+    w = Watch(sid, meta.get("transcript_path"))
 
     def _exit(signum, _frame):
-        raise SystemExit(f"signal {signum}")
+        raise SystemExit(signum)
 
     def _check_limit(_signum, _frame):  # StopFailure(rate_limit) says: look now
         w.check_by = time.time() + LIMIT_ENTRY_WAIT_SECONDS
 
     signal.signal(signal.SIGTERM, _exit)
     signal.signal(signal.SIGHUP, _exit)  # window closed by hand
-    signal.signal(signal.SIGUSR1, _check_limit)
+    def _state_changed(_signum, _frame):  # pause/resume
+        w.state_changed = True
 
-    caf = child = None
+    signal.signal(signal.SIGUSR1, _check_limit)
+    signal.signal(signal.SIGUSR2, _state_changed)
+    update_meta(sid, pausable=True)  # only now is SIGUSR2 safe to send us
+
+    child = None
     phase = "working"
     reason = "stopped"
     resumes = 0
@@ -467,16 +561,16 @@ def cmd_window(sid):
         if meta.get("test_resets_at"):
             outcome = ("limit", meta["test_resets_at"])
         else:
-            caf, ok = keep_awake("☕ Claude is working")
+            w.caf, ok = keep_awake(w.title)
             if ok:
-                print("☕ Sleep disabled (lid-close on battery too) while Claude works.")
+                print("Sleep disabled (lid-close on battery too) while Claude works.")
             else:
-                print("☕ caffeinate only — lid-close sleep NOT blocked on battery.\n"
+                print("caffeinate only — lid-close sleep NOT blocked on battery.\n"
                       "   Set up the sudoers rule from the README to enable that.")
             print(f"   Auto-stops when Claude finishes, battery ≤ {BATTERY_MIN_PERCENT}%, "
                   f"or after {MAX_HOURS}h. On a usage limit it sleeps until the reset, "
                   f"then resumes.  Ctrl+C to stop now.", flush=True)
-            outcome = watch_working(w, caf)
+            outcome = watch_working(w)
 
         while outcome[0] == "limit":
             resets_at = outcome[1]
@@ -486,8 +580,8 @@ def cmd_window(sid):
                 except subprocess.TimeoutExpired:
                     stop_process(child, signal.SIGTERM)
                 child = None
-            stop_process(caf)
-            caf = None
+            stop_process(w.caf)
+            w.caf = None
             if not resets_at:
                 outcome = ("done", "usage limit (reset time unknown)")
                 break
@@ -502,8 +596,9 @@ def cmd_window(sid):
             phase = "resuming"
             resumes += 1
 
-            caf, ok = keep_awake("☕ Claude is resuming")
-            print(f"\n⏰ Woke at {fmt_time(time.time())}; "
+            w.title = "Claude is resuming"
+            w.caf, ok = keep_awake(w.title)
+            print(f"\nWoke at {fmt_time(time.time())}; "
                   f"sleep {'disabled' if ok else 'NOT disabled'}.", flush=True)
             pct = battery_low()
             if pct is not None:
@@ -511,7 +606,7 @@ def cmd_window(sid):
                 break
             if meta.get("test_resets_at"):
                 log(f"{sid}: woke OK")
-                print(f"✅ Test wake worked. Staying awake {TEST_WAKE_AWAKE_SECONDS}s.",
+                print(f"Test wake worked. Staying awake {TEST_WAKE_AWAKE_SECONDS}s.",
                       flush=True)
                 time.sleep(TEST_WAKE_AWAKE_SECONDS)
                 outcome = ("done", "test wake finished")
@@ -528,24 +623,34 @@ def cmd_window(sid):
             cmd.append(RESUME_PROMPT)
             cwd = meta.get("cwd") if os.path.isdir(meta.get("cwd") or "") else None
             log(f"{sid}: resuming ({shlex.join(cmd[1:-1])}) in {cwd}")
-            print(f"▶️  Resuming Claude session (mode: {meta.get('permission_mode')})…\n",
+            print(f"Resuming Claude session (mode: {meta.get('permission_mode')})…\n",
                   flush=True)
             child = subprocess.Popen(cmd, cwd=cwd or os.path.expanduser("~"),
                                      env={**os.environ, CHILD_ENV: "1"},
                                      stdin=subprocess.DEVNULL)
-            outcome = watch_working(w, caf, child)
+            outcome = watch_working(w, child)
         reason = outcome[1]
-    except KeyboardInterrupt:
-        reason = "Claude finished" if phase == "working" else f"cancelled while {phase}"
-    except SystemExit as e:
-        reason = f"stopped by {e}"
+    except (KeyboardInterrupt, SystemExit) as e:
+        # cmd_stop records why before signalling us; no record means the signal
+        # came from you (Ctrl+C in the window, or closing it).
+        reason = (read_json(meta_path(sid)) or {}).get("stop_reason")
+        if not reason and isinstance(e, KeyboardInterrupt):
+            reason = "Stopped with Ctrl+C " + {
+                "working": ("while waiting for your answer" if w.caf is None
+                            else "while Claude was working"),
+                "waiting": "while waiting for the usage-limit reset (resume cancelled)",
+                "resuming": "while resuming",
+            }[phase]
+        elif not reason:
+            reason = {signal.SIGHUP: "Terminal window closed",
+                      signal.SIGTERM: "terminated"}.get(e.code, f"stopped by signal {e.code}")
     finally:
         stop_process(child, signal.SIGTERM)
-        stop_process(caf)
+        stop_process(w.caf)
         window_id = (read_json(meta_path(sid)) or meta).get("window_id")
         release(sid)
         log(f"{sid}: {reason}")
-        print(f"\n😴 {reason} — sleep re-enabled.", flush=True)
+        print(f"\n{reason} — sleep re-enabled.", flush=True)
         # Close our own window once this process has exited (needed when we stop
         # ourselves: usage limit, battery, cap). Harmless if `stop` closes it first.
         if window_id:
@@ -561,7 +666,7 @@ def release(sid):
         set_sleep_disabled(False)
 
 
-def cmd_stop(sid, error=None, event=None, force=False):
+def cmd_stop(sid, error=None, event=None, force=False, reason=None):
     meta = read_json(meta_path(sid))
     if meta is None:
         return
@@ -572,8 +677,12 @@ def cmd_stop(sid, error=None, event=None, force=False):
             log(f"{sid}: turn ended with usage limit; checking reset time")
             os.kill(read_pid(sid), signal.SIGUSR1)
             return
-    if error:
-        log(f"{sid}: turn ended with API error: {error}")
+    if not reason:
+        reason = {
+            "Stop": "Claude finished",
+            "StopFailure": f"turn ended with API error: {error}",
+            "SessionEnd": "Claude session ended",
+        }.get(event, "stopped by command")
     # A very short task can end before the window process has written its pid.
     for _ in range(30):
         pid = read_pid(sid)
@@ -582,6 +691,7 @@ def cmd_stop(sid, error=None, event=None, force=False):
         time.sleep(0.1)
 
     if pid_alive(pid):
+        update_meta(sid, stop_reason=reason)  # so the window reports the real cause
         # Ctrl+C first; SIGTERM if it hasn't exited within 3s.
         for sig in (signal.SIGINT, signal.SIGTERM):
             if pid_alive(pid):
@@ -602,7 +712,7 @@ def wait_for_exit(pid, seconds):
 
 def cmd_stop_all():
     for sid in all_sessions():
-        cmd_stop(sid, force=True)
+        cmd_stop(sid, force=True, reason="stopped by stop --all/panic")
     set_sleep_disabled(False)
 
 
@@ -622,6 +732,8 @@ def cmd_status():
         meta = read_json(meta_path(sid)) or {}
         if session_waiting(sid):
             state = f"waiting for usage-limit reset, resuming at {fmt_time(meta['wake_at'])}"
+        elif session_state(sid) == "paused":
+            state = "paused (Claude is waiting on you)"
         else:
             state = "active" if session_active(sid) else "stale"
         print(f"{sid}  pid={read_pid(sid)}  {state}")
@@ -660,9 +772,11 @@ def cmd_install():
     settings = load_settings()
     hooks = settings.setdefault("hooks", {})
     strip_our_hooks(hooks)
-    for event, action in HOOK_EVENTS.items():
-        hooks.setdefault(event, []).append(
-            {"hooks": [{"type": "command", "command": hook_command(action)}]})
+    for event, matcher, action in HOOKS:
+        group = {"hooks": [{"type": "command", "command": hook_command(action)}]}
+        if matcher:
+            group = {"matcher": matcher, **group}
+        hooks.setdefault(event, []).append(group)
     save_settings(settings)
     print(f"Installed hooks into {SETTINGS_FILE}")
 
@@ -679,7 +793,7 @@ def cmd_uninstall():
 def main():
     args = sys.argv[1:]
     action = args[0] if args else "help"
-    if action in ("start", "stop") and os.environ.get(CHILD_ENV):
+    if action in ("start", "stop", "pause", "resume") and os.environ.get(CHILD_ENV):
         return 0  # a resumed run: its window process manages keep-awake itself
     try:
         if action == "start":
@@ -689,6 +803,14 @@ def main():
         elif action == "stop":
             hook = hook_input()
             cmd_stop(hook["session_id"], hook.get("error"), hook.get("hook_event_name"))
+        elif action == "pause":
+            hook = hook_input()
+            cmd_pause(hook["session_id"], hook.get("tool_name")
+                      or hook.get("notification_type") or hook.get("hook_event_name"))
+        elif action == "resume":
+            hook = hook_input()
+            cmd_resume(hook["session_id"], hook.get("tool_name")
+                       or hook.get("hook_event_name"))
         elif action == "panic":
             cmd_stop_all()
             print("All sessions stopped; sleep re-enabled.")
@@ -709,7 +831,7 @@ def main():
             print(__doc__)
     except Exception as e:  # never break a Claude hook
         log(f"{action} error: {e!r}")
-        if action not in ("start", "stop"):
+        if action not in ("start", "stop", "pause", "resume"):
             raise
     return 0
 
