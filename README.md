@@ -3,20 +3,33 @@
 Keeps your Mac awake **only while Claude Code is working**, including with the lid
 closed on battery, then lets it sleep again as soon as the task is done.
 
-- When you send Claude a prompt, a Terminal window titled **Claude is working**
-  opens **in the background** (focus goes straight back to the app you were using) and
-  runs `caffeinate -ims`. It also runs `pmset -a disablesleep 1`, which is the
-  only thing that stops lid-close sleep on battery.
-- When Claude finishes, the script Ctrl+C's caffeinate, runs `pmset -a disablesleep 0`, and closes the window.
+- When you send Claude a prompt, a background process (no window) runs `caffeinate -ims`
+  and `pmset -a disablesleep 1`, which is the only thing that stops lid-close sleep on
+  battery.
+- When Claude finishes, the script Ctrl+C's caffeinate and runs `pmset -a disablesleep 0`.
 - While Claude is **waiting on you** (a plan to approve, a question, or a permission
-  prompt), it pauses: caffeinate stops, the Mac may sleep, and the window shows
-  **Paused: waiting for your answer**. Keep-awake comes back as soon as you answer.
+  prompt), it pauses: caffeinate stops and the Mac may sleep. Keep-awake comes back as
+  soon as you answer.
 - If Claude **hits a usage limit**, the Mac is allowed to sleep, a wake is scheduled for
   when the limit resets, and then Claude **resumes the task by itself** and the Mac stays
   awake until it's done. See [Usage limits](#usage-limits).
 
 It runs automatically through Claude Code hooks, so it works in every Claude Code
 instance (CLI and desktop app).
+
+## The status window
+
+One Terminal window, **Claude caffeinate**, shows every session (working, paused, or
+waiting for a usage-limit reset), whether sleep is disabled, and recent log lines. It
+opens only when it isn't already open (your first prompt after login, or after you've
+closed it), with focus handed straight back to the app you were using. After that,
+sending prompts never opens or moves a window.
+
+- **Ctrl+C in the window** stops keeping the Mac awake right now for every session, and
+  cancels scheduled resumes. The window stays open and shows idle. Your next prompt
+  starts keeping awake again as normal; nothing needs restarting.
+- **Closing the window** only hides it. Work in progress keeps going in the background,
+  and the window reopens on your next prompt.
 
 ## Setup
 
@@ -75,29 +88,41 @@ Click **Allow**.
 | Claude is waiting on you: plan approval, a question, or a permission prompt | pauses (Mac may sleep) until you answer |
 | Battery ≤ 15% and discharging | stops by itself |
 | 2 hours awake | stops by itself (in case a hook never fired); counted per awake stretch |
-| You close the window or press Ctrl+C | stops and re-enables sleep |
+| You press Ctrl+C in the status window | stops every session and re-enables sleep |
 | Several Claude sessions at once | sleep is re-enabled only when the **last** one stops (or pauses/waits) |
 
 The thresholds are constants at the top of `caffeinate_claude.py` (`BATTERY_MIN_PERCENT`, `MAX_HOURS`).
 
 ## Usage limits
 
-When a session hits its usage limit:
+A session counts as having hit its usage limit in either of two ways:
+- **Wrap-up allowance:** Claude Code tells Claude the limit is reached and gives it a
+  short grace allowance to finish up, so the turn ends normally. The script spots that
+  note in the session transcript when the turn ends.
+- **Hard limit:** the turn is cut off with a rate-limit error (the `StopFailure` hook).
 
-1. The window stops caffeinate, turns sleep back on, and retitles itself
-   **Usage limit — resuming at 1:21 PM**. The reset time comes from Claude Code's
-   own record of the limit, and the resume is set for 90 seconds after it.
+Then:
+
+1. The session stops caffeinate, turns sleep back on, and shows
+   **Usage limit, resuming at 1:21 PM** in the status window. The reset time comes from
+   Claude Code's record of a hard limit. After a wrap-up there's no recorded reset time, so
+   the script sends one tiny request (`claude -p --no-session-persistence`, saved to no
+   session). While the limit is in effect the request is rejected without using any of your
+   usage, and the reply says when it resets. The resume is set for 90 seconds after the reset.
 2. It schedules a wake with `pmset schedule wake`, so the Mac wakes itself up.
 3. At that time it turns sleep off again, restarts caffeinate, and runs
    `claude -p --resume <session> --permission-mode <the session's mode>` with the prompt
-   *"Your usage limit has reset. Continue the task…"*. Output shows in the window.
-4. When that finishes, the Mac is allowed to sleep again and the window closes. If it hits
+   *"Your usage limit has reset. Continue the task…"*. Its output is saved to
+   `~/.claude/caffeinate/<session-id>.out`. It uses the same `claude` binary the session
+   was running, or the newest copy bundled with the Claude app if that one has since
+   been updated away.
+4. When that finishes, the Mac is allowed to sleep again. If it hits
    the limit again (e.g. the weekly limit), it repeats, up to 3 times.
 
 Ways it's cancelled:
 - You type into the session yourself before the reset. You've taken over, so the
   scheduled resume is dropped.
-- You press Ctrl+C in the window, or run `stop --all` or `panic`.
+- You press Ctrl+C in the status window, or run `stop --all` or `panic`.
 - The battery is at or below 15% when it wakes. It skips the resume and lets the Mac sleep.
 
 Quitting the Claude app does **not** cancel it; the resume runs on its own.
@@ -129,7 +154,8 @@ python3 caffeinate_claude.py status
 ```
 
 Lists active, paused and waiting sessions (with their resume time) and whether sleep is
-currently disabled. `pmset -g sched` shows scheduled wake-ups.
+currently disabled, and whether the status window is open. `pmset -g sched` shows
+scheduled wake-ups.
 
 ```bash
 python3 caffeinate_claude.py panic
@@ -145,4 +171,5 @@ You can also check the setting directly with `pmset -g | grep SleepDisabled`. Lo
 - With sleep disabled and the lid closed, the Mac keeps running in your bag. Claude's work is
   mostly waiting on the network and fairly light, but a long local build or test run
   can make it warm.
-- `Stop` fires every time Claude finishes a reply, so the window opens and closes once per prompt.
+- The status window's command starts with a space so it stays out of your shell history (up arrow).
+  That relies on zsh's `hist_ignore_space` option (or bash's `HISTCONTROL=ignorespace`).
