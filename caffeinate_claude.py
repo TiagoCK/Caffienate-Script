@@ -26,7 +26,7 @@ as the last working session stops or waits, the battery gets low, or MAX_HOURS e
 
 Usage:
     caffeinate_claude.py start | stop [--all] | status | panic | install | uninstall
-    caffeinate_claude.py test-wake <minutes>
+    caffeinate_claude.py check | login | test-wake <minutes>
 """
 
 import glob
@@ -387,13 +387,41 @@ def parse_reset_text(text, now=None):
     return t.timestamp()
 
 
+# Environment for a claude the script starts itself. The desktop app's variables
+# (CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH, ...) tell the CLI that
+# the app will sign it in, which it can't do for us; without them the CLI uses its own
+# login from the keychain (see `login`).
+RESUME_ENV_KEEP = ("HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL",
+                   "LC_CTYPE", "TERM", "SSH_AUTH_SOCK", "__CF_USER_TEXT_ENCODING")
+LOGIN_HINT = "run: python3 caffeinate_claude.py login"
+
+
+def resume_env():
+    env = {k: v for k, v in os.environ.items() if k in RESUME_ENV_KEEP}
+    env.setdefault("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    env[CHILD_ENV] = "1"
+    return env
+
+
+def cli_logged_in(claude):
+    """Whether `claude` (run like a resume) is signed in: True, False, or None if unknown."""
+    try:
+        r = subprocess.run([claude, "auth", "status"], env=resume_env(),
+                           cwd=os.path.expanduser("~"), stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60,
+                           start_new_session=True)
+        return bool(json.loads(r.stdout).get("loggedIn"))
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+        return None
+
+
 def probe_reset_time(claude):
     """Ask the API whether the usage limit is still in effect, without touching any
     session. Returns the reset time, time.time() if not limited, or None if unknown.
     While limited the request is rejected, so it uses no usage."""
     try:
         r = subprocess.run([claude, "-p", "--no-session-persistence", PROBE_PROMPT],
-                           cwd=os.path.expanduser("~"), env={**os.environ, CHILD_ENV: "1"},
+                           cwd=os.path.expanduser("~"), env=resume_env(),
                            stdin=subprocess.DEVNULL, capture_output=True, text=True,
                            timeout=180)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -626,6 +654,7 @@ class Watch:
             self.offset = 0
         self.check_by = None  # set by SIGUSR1: expect a limit entry by this time
         self.wrap_up = False  # Claude Code said the limit was reached (grace allowance)
+        self.resume_out = None  # where the resumed claude's output goes
 
     def limit(self):
         """Returns the reset time if a usage-limit error entry has appeared, else None.
@@ -692,7 +721,11 @@ def watch_working(w, child=None):
                 return "limit", resets_at
             if w.wrap_up:  # the resumed run wrapped up on the limit
                 return "limit", 0
-            return "done", f"resumed task finished (exit {child.returncode})"
+            if child.returncode == 0:
+                return "done", "resumed task finished"
+            tail = last_line(w.resume_out)
+            hint = f" ({LOGIN_HINT})" if "logged in" in tail.lower() or "login" in tail else ""
+            return "done", f"resume failed (exit {child.returncode}): {tail}{hint}"
         if w.caf.poll() is not None:
             return "done", "caffeinate exited"
         if now >= deadline:
@@ -716,11 +749,11 @@ def watch_working(w, child=None):
         time.sleep(1)
 
 
-def wait_for_reset(sid, resets_at):
+def wait_for_reset(sid, resets_at, note=""):
     """Let the Mac sleep until the limit resets; a scheduled wake gets us back."""
     wake_at = resets_at + WAKE_DELAY_SECONDS
     update_meta(sid, state="waiting", resets_at=resets_at, wake_at=wake_at)
-    set_status(sid, f"Usage limit, resuming at {fmt_time(wake_at)}")
+    set_status(sid, f"Usage limit, resuming at {fmt_time(wake_at)}{note}")
     if not others_active(sid):
         set_sleep_disabled(False)
     scheduled = schedule_wake(wake_at)
@@ -823,8 +856,13 @@ def cmd_session(sid):
             if resumes >= MAX_RESUMES:
                 outcome = ("done", f"usage limit hit again after {MAX_RESUMES} resumes")
                 break
+            claude = find_claude(read_json(meta_path(sid)) or meta)
+            note = ""
+            if claude and cli_logged_in(claude) is False:
+                note = " (can't resume until the claude CLI is signed in)"
+                log(f"{sid}: claude CLI isn't signed in, so the resume will fail ({LOGIN_HINT})")
             phase = "waiting"
-            wait_for_reset(sid, resets_at)
+            wait_for_reset(sid, resets_at, note)
             phase = "resuming"
             resumes += 1
 
@@ -849,6 +887,9 @@ def cmd_session(sid):
             if not claude:
                 outcome = ("done", "claude CLI not found, skipped resume")
                 break
+            if cli_logged_in(claude) is False:
+                outcome = ("done", f"resume skipped: the claude CLI isn't signed in ({LOGIN_HINT})")
+                break
             cmd = [claude, "-p", "--resume", sid]
             if meta.get("permission_mode"):
                 cmd += ["--permission-mode", meta["permission_mode"]]
@@ -859,9 +900,13 @@ def cmd_session(sid):
                   flush=True)
             w.wrap_up = False
             child_started = time.time()
-            child = subprocess.Popen(cmd, cwd=cwd or os.path.expanduser("~"),
-                                     env={**os.environ, CHILD_ENV: "1"},
-                                     stdin=subprocess.DEVNULL)
+            w.resume_out = os.path.join(STATE_DIR, f"{sid}.resume.out")
+            with open(w.resume_out, "a") as out:  # kept: later prompts don't truncate it
+                out.write(f"\n--- resume at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                out.flush()
+                child = subprocess.Popen(cmd, cwd=cwd or os.path.expanduser("~"),
+                                         env=resume_env(), stdin=subprocess.DEVNULL,
+                                         stdout=out, stderr=subprocess.STDOUT)
             outcome = watch_working(w, child)
         reason = outcome[1]
     except (KeyboardInterrupt, SystemExit) as e:
@@ -952,6 +997,48 @@ def cmd_stop_all():
     for sid in all_sessions():
         cmd_stop(sid, force=True, reason="stopped by stop --all/panic")
     set_sleep_disabled(False)
+
+
+def last_line(path):
+    try:
+        with open(path, errors="replace") as f:
+            lines = [l.strip() for l in f if l.strip()]
+        return lines[-1][:200] if lines else "(no output)"
+    except (OSError, TypeError):
+        return "(no output)"
+
+
+def cmd_login():
+    """Sign the claude CLI in (once), so resumes started by this script can run."""
+    claude = find_claude({})
+    if not claude:
+        print("Couldn't find the claude CLI.")
+        return
+    print(f"Signing in {claude}\nA browser window will open; sign in there.\n", flush=True)
+    os.execve(claude, [claude, "auth", "login"], resume_env())
+
+
+def cmd_check():
+    """Will auto-resume work? Checks each piece it depends on."""
+    def show(ok, what, detail=""):
+        print(f"[{'OK' if ok else 'PROBLEM'}] {what}{': ' + detail if detail else ''}")
+
+    claude = find_claude({})
+    show(bool(claude), "claude CLI", claude or "not found")
+    if claude:
+        signed_in = cli_logged_in(claude)
+        show(signed_in is True, "claude CLI signed in",
+             {True: "yes", False: f"no ({LOGIN_HINT})", None: "couldn't tell"}[signed_in])
+    for args, what in (([PMSET, "-a", "disablesleep", "1"], "sudo: disable sleep"),
+                       ([PMSET, "schedule", "wake", "01/01/30 00:00:00"], "sudo: schedule wakes")):
+        r = subprocess.run(["sudo", "-n", "-l", *args], capture_output=True, text=True)
+        show(r.returncode == 0, what, "allowed" if r.returncode == 0 else "not allowed (see README)")
+    hooks = load_settings().get("hooks", {})
+    missing = [e for e, _, a in HOOKS
+               if not any(hook_command(a) == h.get("command")
+                          for g in hooks.get(e, []) for h in g.get("hooks", []))]
+    show(not missing, "hooks installed", "all" if not missing else f"missing {', '.join(missing)} "
+         "(run: python3 caffeinate_claude.py install)")
 
 
 def cmd_test_wake(minutes):
@@ -1060,6 +1147,10 @@ def main():
         elif action == "_close":  # used by windows from older versions
             time.sleep(1)  # let the window's process finish exiting
             close_window(args[1])
+        elif action == "check":
+            cmd_check()
+        elif action == "login":
+            cmd_login()
         elif action == "test-wake":
             cmd_test_wake(float(args[1]) if len(args) > 1 else 3)
         elif action == "status":

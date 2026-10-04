@@ -76,6 +76,22 @@ sudo -n /usr/bin/pmset -a disablesleep 0 && echo ok
 The first time it runs, macOS asks whether Claude/your terminal may control **Terminal**.
 Click **Allow**.
 
+### 4. Sign the claude CLI in (one-time, for usage-limit resumes)
+
+The automatic resume after a usage limit runs `claude` itself, and it can't use the
+Claude desktop app's sign-in: the app signs in only the `claude` processes it starts.
+Sign the CLI in once (a browser window opens; the login is kept in your keychain):
+
+```bash
+python3 caffeinate_claude.py login
+```
+
+Then confirm everything auto-resume needs is in place:
+
+```bash
+python3 caffeinate_claude.py check
+```
+
 ## Safety nets
 
 `disablesleep` is a global setting, so the script works hard to never leave it on:
@@ -148,6 +164,13 @@ Then unplug, close the lid, and wait about 5 minutes. Open it and look for `woke
 Claude; it just wakes, logs, and stays up 60 seconds.
 
 ## Commands
+
+```bash
+python3 caffeinate_claude.py check
+```
+
+Checks everything auto-resume depends on: the `claude` CLI, its sign-in, the sudo rules,
+and the hooks.
 
 ```bash
 python3 caffeinate_claude.py status
