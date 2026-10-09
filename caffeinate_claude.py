@@ -6,6 +6,7 @@ Driven by Claude Code hooks:
     Stop / StopFailure / SessionEnd -> stop   (Ctrl+C's that process)
     PreToolUse(ExitPlanMode|AskUserQuestion), Notification(permission prompt) -> pause
     PostToolUse / PostToolUseFailure -> resume
+    Notification(quota_auto_resume_*) -> quota   (logs Claude Code's own auto-continue)
 
 Each session's keep-awake runs in the background with no window. A single status
 window lists the sessions; it opens only when it isn't already open, so prompts never
@@ -15,10 +16,12 @@ closing it just hides it until the next prompt.
 While paused (a plan, question or permission prompt is waiting on you) caffeinate is
 stopped and the Mac may sleep; keep-awake comes back once you answer.
 
-If Claude hits its usage limit, the session lets the Mac sleep, schedules a wake for
-when the limit resets (`pmset schedule wake`), then resumes the session headlessly
-with `claude -p --resume` and keeps the Mac awake until that finishes. The limit is
-detected through the StopFailure hook and, as a fallback, by watching the transcript.
+If Claude hits its usage limit, the session lets the Mac sleep and schedules a wake
+(`pmset schedule wake`) for just before the reset, then stays awake through it so Claude
+Code's own auto-continue can carry on in the app. If the app hasn't continued a few
+minutes after the reset, it resumes the session headlessly with `claude -p --resume`
+and keeps the Mac awake until that finishes. The limit is detected through the
+StopFailure hook and, as a fallback, by watching the transcript.
 
 Lid-closed-on-battery sleep can only be overridden with `pmset -a disablesleep 1`,
 which needs a passwordless sudoers rule (see README). Sleep is re-enabled as soon
@@ -61,7 +64,16 @@ QUICK_LIMIT_SECONDS = 60  # a resume that hits the limit this fast did no work
 MAX_QUICK_LIMITS = 10  # ...and isn't counted, up to this many times
 PROBE_PROMPT = "Reply with just OK"
 LIMIT_ENTRY_WAIT_SECONDS = 15  # after StopFailure, how long to wait for the transcript
-WAKE_DELAY_SECONDS = 90  # wake this long after the reset, to be safely past it
+# After a hard limit, Claude Code's own "Automatic continue" carries on in the app (seen
+# about 10 min after the reset), but gives up if the Mac was asleep when the limit
+# reset. So wake a little before the reset and stay awake through it; if the app still
+# hasn't continued RESET_GRACE_SECONDS after the reset, resume in the background.
+# After a wrap-up the app doesn't continue on its own, so we resume straight away,
+# POST_RESET_DELAY_SECONDS after the reset to be safely past it.
+WAKE_EARLY_SECONDS = int(os.environ.get("CAFFEINATE_WAKE_EARLY", 180))
+RESET_GRACE_SECONDS = int(os.environ.get("CAFFEINATE_RESET_GRACE", 900))
+POST_RESET_DELAY_SECONDS = int(os.environ.get("CAFFEINATE_POST_RESET_DELAY", 90))
+APP_ACTIVITY_CHECK_SECONDS = 10
 MAX_WAIT_DAYS = 7  # don't schedule resumes further out than this
 MAX_RESUMES = 3  # give up after this many limit -> resume cycles
 TEST_WAKE_AWAKE_SECONDS = 60
@@ -78,6 +90,9 @@ HOOKS = [
     # Waiting on you: a plan to approve, a question, or a permission prompt.
     ("PreToolUse", "ExitPlanMode|AskUserQuestion", "pause"),
     ("Notification", "permission_prompt|elicitation_dialog", "pause"),
+    # Claude Code's own auto-continue after a usage limit: log it, fall back if it gives up.
+    ("Notification", "quota_auto_resume_fired|quota_auto_resume_stale|quota_auto_resume_disabled",
+     "quota"),
     # You answered and the tool ran (or was rejected/denied): back to work.
     ("PostToolUse", None, "resume"),
     ("PostToolUseFailure", None, "resume"),
@@ -172,24 +187,27 @@ def all_sessions():
 
 
 def session_waiting(sid):
+    """Waiting out a usage limit: asleep until the reset ('waiting'), or awake around
+    it watching for the app to continue on its own ('watching')."""
     meta = read_json(meta_path(sid)) or {}
-    return meta.get("state") == "waiting" and pid_alive(read_pid(sid))
+    return meta.get("state") in ("waiting", "watching") and pid_alive(read_pid(sid))
 
 
 def session_state(sid):
-    """'working', 'paused' (waiting on you), 'waiting' (usage-limit reset), or None
-    if the session's window process isn't running."""
+    """'working', 'paused' (waiting on you), 'waiting' (asleep until a usage-limit
+    reset), 'watching' (awake around the reset), or None if the session's process
+    isn't running."""
     if not pid_alive(read_pid(sid)):
         return None
     return (read_json(meta_path(sid)) or {}).get("state", "working")
 
 
 def session_active(sid):
-    """Active = keeping the Mac awake: its window process is alive and working
-    (not paused or waiting for a reset), or it was started moments ago."""
+    """Active = keeping the Mac awake: its process is alive and working or watching a
+    reset (not paused or asleep until a reset), or it was started moments ago."""
     meta = read_json(meta_path(sid)) or {}
     if pid_alive(read_pid(sid)):
-        return meta.get("state", "working") == "working"
+        return meta.get("state", "working") in ("working", "watching")
     return time.time() - meta.get("started", 0) < STARTUP_GRACE_SECONDS
 
 
@@ -299,7 +317,10 @@ def find_claude(meta=None):
     copy bundled with the Claude desktop app, then PATH and the usual install spots."""
     meta = meta or {}
     if meta.get("claude_bin_override"):
-        return meta["claude_bin_override"]
+        if os.access(meta["claude_bin_override"], os.X_OK):
+            return meta["claude_bin_override"]
+        log(f"CAFFEINATE_CLAUDE_BIN {meta['claude_bin_override']} isn't an executable")
+        return None
     if meta.get("claude_bin") and os.access(meta["claude_bin"], os.X_OK):
         return meta["claude_bin"]
 
@@ -351,6 +372,30 @@ def usage_limit_entry(transcript, offset):
         if entry.get("usageLimitNote"):
             note = entry["usageLimitNote"]
     return found, note, offset + end
+
+
+def app_activity(transcript, offset):
+    """Whether the session has done real work after `offset` (a non-meta prompt or a
+    real model reply), i.e. Claude continued. Returns (active, new_offset)."""
+    try:
+        with open(transcript, "rb") as f:
+            f.seek(offset)
+            chunk = f.read()
+    except (OSError, TypeError):
+        return False, offset
+    end = chunk.rfind(b"\n") + 1
+    for line in chunk[:end].splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind = entry.get("type")
+        if kind == "user" and not entry.get("isMeta"):
+            return True, offset + end
+        if (kind == "assistant" and not entry.get("isApiErrorMessage")
+                and (entry.get("message") or {}).get("model") != "<synthetic>"):
+            return True, offset + end
+    return False, offset + end
 
 
 def reset_time(entry):
@@ -442,9 +487,13 @@ def probe_reset_time(claude):
 def cmd_start(hook, extra=None):
     sid = hook["session_id"]
     if session_waiting(sid):
-        # You came back and typed before the reset: take over from the scheduled resume.
-        log(f"{sid}: new prompt while waiting for reset; cancelling scheduled resume")
-        cmd_stop(sid, force=True, reason="new prompt; scheduled resume cancelled")
+        # A new prompt while waiting out a limit: Claude Code's own auto-continue (around
+        # the reset) or you typing. Either way the app has it now; drop our resume.
+        if (read_json(meta_path(sid)) or {}).get("state") == "watching":
+            reason = "Claude continued in the app; background resume not needed"
+        else:
+            reason = "new prompt; scheduled resume cancelled"
+        cmd_stop(sid, force=True, reason=reason)  # the session logs the reason
     elif session_state(sid) == "paused":
         cmd_resume(sid, "new prompt")
         update_meta(sid, **{k: hook[k] for k in ("cwd", "permission_mode") if k in hook})
@@ -535,7 +584,9 @@ def session_label(sid):
     elif state == "paused":
         text = "Paused: waiting for your answer"
     elif state == "waiting":
-        text = f"Usage limit, resuming at {fmt_time(meta.get('wake_at', 0))}"
+        text = meta.get("status") or f"Usage limit, waking at {fmt_time(meta.get('wake_at', 0))}"
+    elif state == "watching":
+        text = meta.get("status") or "Usage limit: waiting for Claude to continue"
     else:
         text = meta.get("status") or "Working"
     project = os.path.basename(meta.get("cwd") or "") or "-"
@@ -548,6 +599,7 @@ def ctrl_c_reason(sid):
     return "Stopped with Ctrl+C in the status window " + {
         "paused": "while waiting for your answer",
         "waiting": "while waiting for the usage-limit reset (resume cancelled)",
+        "watching": "while waiting for the usage-limit reset (resume cancelled)",
     }.get(state, "while Claude was working")
 
 
@@ -618,6 +670,31 @@ def cmd_dashboard():
             pass
 
 
+def in_plan_mode(sid, meta=None):
+    meta = read_json(meta_path(sid)) or meta or {}
+    return meta.get("permission_mode") == "plan" and not meta.get("test_resets_at")
+
+
+def note_mode(hook):
+    """Keep the session's permission mode current: it changes mid-turn (approving a
+    plan leaves plan mode), and resumes use it."""
+    mode, sid = hook.get("permission_mode"), hook["session_id"]
+    meta = read_json(meta_path(sid)) if mode else None
+    if meta is not None and meta.get("permission_mode") != mode:
+        update_meta(sid, permission_mode=mode)
+
+
+def cmd_quota(hook):
+    """Claude Code's own auto-continue reported something: log it, and if it gave up
+    while we're waiting out the limit, fall back to the background resume now."""
+    sid = hook["session_id"]
+    kind = hook.get("notification_type") or "quota notification"
+    log(f"{sid}: Claude Code: {kind}: {hook.get('message', '')}".rstrip(": "))
+    if kind in ("quota_auto_resume_stale", "quota_auto_resume_disabled") and session_waiting(sid):
+        update_meta(sid, fallback_reason=kind.replace("quota_auto_resume_", ""))
+        os.kill(read_pid(sid), signal.SIGUSR1)
+
+
 def cmd_pause(sid, trigger):
     """Claude is waiting on you: let the window process stop keeping the Mac awake."""
     if session_state(sid) != "working":
@@ -655,6 +732,7 @@ class Watch:
         self.check_by = None  # set by SIGUSR1: expect a limit entry by this time
         self.wrap_up = False  # Claude Code said the limit was reached (grace allowance)
         self.resume_out = None  # where the resumed claude's output goes
+        self.poked = False  # SIGUSR1: re-check (limit entry, or the app gave up)
 
     def limit(self):
         """Returns the reset time if a usage-limit error entry has appeared, else None.
@@ -749,21 +827,32 @@ def watch_working(w, child=None):
         time.sleep(1)
 
 
-def wait_for_reset(sid, resets_at, note=""):
-    """Let the Mac sleep until the limit resets; a scheduled wake gets us back."""
-    wake_at = resets_at + WAKE_DELAY_SECONDS
-    update_meta(sid, state="waiting", resets_at=resets_at, wake_at=wake_at)
-    set_status(sid, f"Usage limit, resuming at {fmt_time(wake_at)}{note}")
+def wait_for_reset(sid, w, resets_at, note="", watch_app=True):
+    """Wait out a usage limit. Returns "continued" if Claude continued in the app on its
+    own, or "fallback" if we should resume it in the background.
+
+    With watch_app, the Mac sleeps until WAKE_EARLY_SECONDS before the reset, then stays
+    awake through it so Claude Code's own auto-continue can fire (it gives up if the Mac
+    slept through the reset); after RESET_GRACE_SECONDS, or if the app reports it gave
+    up, we fall back. Without it (reset time exact or unknown), wake at resets_at and
+    resume straight away.
+    """
+    now = time.time()
+    if watch_app:
+        wake_at = max(now, resets_at - WAKE_EARLY_SECONDS)
+        fallback_at = resets_at + RESET_GRACE_SECONDS
+    else:
+        wake_at = fallback_at = resets_at
+    update_meta(sid, state="waiting", resets_at=resets_at, wake_at=wake_at,
+                fallback_reason=None)
+    set_status(sid, f"Usage limit, waking at {fmt_time(wake_at)}{note}")
     if not others_active(sid):
         set_sleep_disabled(False)
-    scheduled = schedule_wake(wake_at)
-    print(f"\nUsage limit hit. Sleeping allowed; resuming at {fmt_time(wake_at)}.")
-    if not scheduled:
-        print("   Couldn't schedule a wake (see README sudoers rule) — the resume "
-              "will run the next time the Mac is awake after that.")
-    print("   Ctrl+C in the status window cancels the resume.", flush=True)
-    log(f"{sid}: usage limit; waiting until {fmt_time(wake_at)} "
-        f"(wake {'scheduled' if scheduled else 'NOT scheduled'})")
+    scheduled = wake_at > now + 30 and schedule_wake(wake_at)
+    print(f"\nUsage limit hit (resets {fmt_time(resets_at)}). Sleeping allowed; "
+          f"waking at {fmt_time(wake_at)}.", flush=True)
+    log(f"{sid}: usage limit (resets {fmt_time(resets_at)}); sleeping until "
+        f"{fmt_time(wake_at)} (wake {'scheduled' if scheduled else 'not scheduled'})")
     try:
         # time.sleep pauses while the Mac sleeps, so poll the wall clock.
         while time.time() < wake_at:
@@ -774,7 +863,35 @@ def wait_for_reset(sid, resets_at, note=""):
         raise
     if scheduled:  # if the Mac was already awake it stays listed; tidy it up
         schedule_wake(wake_at, cancel=True, quiet=True)
-    update_meta(sid, state="working")
+    if fallback_at <= time.time():
+        return "fallback"
+
+    # Awake around the reset: give Claude Code the chance to continue in the app.
+    update_meta(sid, state="watching")
+    if w.caf is None:
+        w.caf, _ = keep_awake(sid, "")
+    set_status(sid, f"Usage limit resets {fmt_time(resets_at)}; waiting for Claude "
+                    f"to continue{note}")
+    log(f"{sid}: awake for the reset; waiting for Claude to continue in the app")
+    offset, next_check = w.offset, 0
+    while time.time() < fallback_at:
+        if w.poked:
+            w.poked = False
+            gave_up = (read_json(meta_path(sid)) or {}).get("fallback_reason")
+            if gave_up:
+                log(f"{sid}: the app didn't continue on its own ({gave_up})")
+                return "fallback"
+        if time.time() >= next_check:
+            next_check = time.time() + APP_ACTIVITY_CHECK_SECONDS
+            active, offset = app_activity(w.transcript, offset)
+            if active:
+                log(f"{sid}: Claude continued in the app")
+                return "continued"
+        time.sleep(1)
+    grace = (f"{RESET_GRACE_SECONDS // 60} min" if RESET_GRACE_SECONDS >= 60
+             else f"{RESET_GRACE_SECONDS} s")
+    log(f"{sid}: the app didn't continue within {grace} of the reset")
+    return "fallback"
 
 
 def cmd_session(sid):
@@ -788,8 +905,9 @@ def cmd_session(sid):
     def _exit(signum, _frame):
         raise SystemExit(signum)
 
-    def _check_limit(_signum, _frame):  # StopFailure(rate_limit) says: look now
+    def _check_limit(_signum, _frame):  # StopFailure(rate_limit)/quota says: look now
         w.check_by = time.time() + LIMIT_ENTRY_WAIT_SECONDS
+        w.poked = True
 
     signal.signal(signal.SIGTERM, _exit)
     signal.signal(signal.SIGHUP, _exit)
@@ -835,21 +953,31 @@ def cmd_session(sid):
                     quick_limits += 1  # rejected right away: it did no work
                     if quick_limits <= MAX_QUICK_LIMITS:
                         resumes -= 1
+            watch_app = not meta.get("test_resets_at")
+            reset_known = True
             if not resets_at:
-                # Wrap-up turns don't record a reset time: ask the API.
+                # A wrap-up turn: the app won't continue it on its own, and there's no
+                # recorded reset time, so ask the API and resume shortly after it.
                 set_status(sid, "Usage limit, checking reset time")
                 claude = find_claude(read_json(meta_path(sid)) or meta)
-                resets_at = probe_reset_time(claude) if claude else None
-                # wait_for_reset adds WAKE_DELAY_SECONDS; cancel it out where we
-                # want the resume at an exact time rather than just after a reset.
+                resets_at, watch_app = (probe_reset_time(claude) if claude else None), False
                 if resets_at is None:
                     log(f"{sid}: usage limit; reset time unknown, retrying in "
                         f"{PROBE_RETRY_SECONDS // 60} min")
-                    resets_at = time.time() + PROBE_RETRY_SECONDS - WAKE_DELAY_SECONDS
+                    resets_at, reset_known = time.time() + PROBE_RETRY_SECONDS, False
                 elif resets_at <= time.time():  # not limited (any more): resume now
-                    resets_at = time.time() - WAKE_DELAY_SECONDS
+                    resets_at = time.time()
+                else:
+                    resets_at += POST_RESET_DELAY_SECONDS
             stop_process(w.caf)
             w.caf = None
+            if in_plan_mode(sid, meta) and not watch_app:
+                # Nothing can get past plan approval without you, and the app won't
+                # continue a wrap-up on its own: no point waking the Mac for it.
+                when = f" (resets {fmt_time(resets_at)})" if reset_known else ""
+                outcome = ("done", f"usage limit{when} while in plan mode: continue it "
+                                   f"yourself after the reset (no background resume)")
+                break
             if resets_at - time.time() > MAX_WAIT_DAYS * 86400:
                 outcome = ("done", f"usage limit resets too far out ({fmt_time(resets_at)})")
                 break
@@ -862,12 +990,31 @@ def cmd_session(sid):
                 note = " (can't resume until the claude CLI is signed in)"
                 log(f"{sid}: claude CLI isn't signed in, so the resume will fail ({LOGIN_HINT})")
             phase = "waiting"
-            wait_for_reset(sid, resets_at, note)
+            if wait_for_reset(sid, w, resets_at, note, watch_app) == "continued":
+                # Claude Code continued the session in the app (no new prompt reached
+                # us, or we'd have been handed over): keep it awake as a normal turn.
+                phase = "working"
+                w.status, w.wrap_up = "Working", False
+                update_meta(sid, state="working")
+                if w.caf is None:
+                    w.caf, _ = keep_awake(sid, w.status)
+                set_status(sid, w.status)
+                outcome = watch_working(w)
+                continue
+            if in_plan_mode(sid, meta):
+                outcome = ("done", "usage limit reset; the session is in plan mode, so it "
+                                   "needs your approval (not resumed in the background)")
+                break
             phase = "resuming"
             resumes += 1
 
             w.status = "Resuming"
-            w.caf, ok = keep_awake(sid, w.status)
+            update_meta(sid, state="working")
+            if w.caf is None:
+                w.caf, ok = keep_awake(sid, w.status)
+            else:
+                set_status(sid, w.status)
+                ok = set_sleep_disabled(True)
             print(f"\nWoke at {fmt_time(time.time())}; "
                   f"sleep {'disabled' if ok else 'NOT disabled'}.", flush=True)
             pct = battery_low()
@@ -904,9 +1051,13 @@ def cmd_session(sid):
             with open(w.resume_out, "a") as out:  # kept: later prompts don't truncate it
                 out.write(f"\n--- resume at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 out.flush()
-                child = subprocess.Popen(cmd, cwd=cwd or os.path.expanduser("~"),
-                                         env=resume_env(), stdin=subprocess.DEVNULL,
-                                         stdout=out, stderr=subprocess.STDOUT)
+                try:
+                    child = subprocess.Popen(cmd, cwd=cwd or os.path.expanduser("~"),
+                                             env=resume_env(), stdin=subprocess.DEVNULL,
+                                             stdout=out, stderr=subprocess.STDOUT)
+                except OSError as e:
+                    outcome = ("done", f"resume failed to start: {e}")
+                    break
             outcome = watch_working(w, child)
         reason = outcome[1]
     except (KeyboardInterrupt, SystemExit) as e:
@@ -923,14 +1074,18 @@ def cmd_session(sid):
         elif not reason:
             reason = {signal.SIGHUP: "Terminal window closed",
                       signal.SIGTERM: "terminated"}.get(e.code, f"stopped by signal {e.code}")
+    except Exception as e:  # never leave the Mac awake (or the reason blank) on a bug
+        import traceback
+        traceback.print_exc()
+        reason = f"stopped by an error: {e!r} (details in {out_path(sid)})"
     finally:
         stop_process(child, signal.SIGTERM)
         stop_process(w.caf)
         release(sid)
         log(f"{sid}: {reason}")
         print(f"\n{reason} — sleep re-enabled.", flush=True)
-        if not resumes:
-            remove(out_path(sid))  # keep the output only when Claude was resumed
+        if not resumes and not reason.startswith("stopped by an error"):
+            remove(out_path(sid))  # keep the output only when it's worth reading
 
 
 def release(sid):
@@ -1043,9 +1198,9 @@ def cmd_check():
 
 def cmd_test_wake(minutes):
     """Simulate a usage limit that resets in `minutes` (no Claude resume)."""
-    resets_at = time.time() + minutes * 60 - WAKE_DELAY_SECONDS
+    resets_at = time.time() + minutes * 60
     cmd_start({"session_id": "test-wake"}, extra={"test_resets_at": resets_at})
-    print(f"Test wake scheduled for {fmt_time(resets_at + WAKE_DELAY_SECONDS)}. Unplug, "
+    print(f"Test wake scheduled for {fmt_time(resets_at)}. Unplug, "
           f"close the lid, and afterwards look for 'woke OK' in {LOG_FILE}")
 
 
@@ -1056,7 +1211,7 @@ def cmd_status():
     for sid in sessions:
         meta = read_json(meta_path(sid)) or {}
         if session_waiting(sid):
-            state = f"waiting for usage-limit reset, resuming at {fmt_time(meta['wake_at'])}"
+            state = f"usage limit: {meta.get('status') or 'waiting for the reset'}"
         elif session_state(sid) == "paused":
             state = "paused (Claude is waiting on you)"
         else:
@@ -1119,7 +1274,7 @@ def cmd_uninstall():
 def main():
     args = sys.argv[1:]
     action = args[0] if args else "help"
-    if action in ("start", "stop", "pause", "resume") and os.environ.get(CHILD_ENV):
+    if action in ("start", "stop", "pause", "resume", "quota") and os.environ.get(CHILD_ENV):
         return 0  # a resumed run: its session process manages keep-awake itself
     try:
         if action == "start":
@@ -1128,13 +1283,18 @@ def main():
             cmd_stop_all()
         elif action == "stop":
             hook = hook_input()
+            note_mode(hook)
             cmd_stop(hook["session_id"], hook.get("error"), hook.get("hook_event_name"))
+        elif action == "quota":
+            cmd_quota(hook_input())
         elif action == "pause":
             hook = hook_input()
+            note_mode(hook)
             cmd_pause(hook["session_id"], hook.get("tool_name")
                       or hook.get("notification_type") or hook.get("hook_event_name"))
         elif action == "resume":
             hook = hook_input()
+            note_mode(hook)
             cmd_resume(hook["session_id"], hook.get("tool_name")
                        or hook.get("hook_event_name"))
         elif action == "panic":
@@ -1163,7 +1323,7 @@ def main():
             print(__doc__)
     except Exception as e:  # never break a Claude hook
         log(f"{action} error: {e!r}")
-        if action not in ("start", "stop", "pause", "resume"):
+        if action not in ("start", "stop", "pause", "resume", "quota"):
             raise
     return 0
 

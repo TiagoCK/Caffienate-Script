@@ -119,21 +119,40 @@ A session counts as having hit its usage limit in either of two ways:
 
 Then:
 
-1. The session stops caffeinate, turns sleep back on, and shows
-   **Usage limit, resuming at 1:21 PM** in the status window. The reset time comes from
-   Claude Code's record of a hard limit. After a wrap-up there's no recorded reset time, so
-   the script sends one tiny request (`claude -p --no-session-persistence`, saved to no
-   session). While the limit is in effect the request is rejected without using any of your
-   usage, and the reply says when it resets. The resume is set for 90 seconds after the reset.
-2. It schedules a wake with `pmset schedule wake`, so the Mac wakes itself up.
-3. At that time it turns sleep off again, restarts caffeinate, and runs
-   `claude -p --resume <session> --permission-mode <the session's mode>` with the prompt
-   *"Your usage limit has reset. Continue the task…"*. Its output is saved to
-   `~/.claude/caffeinate/<session-id>.out`. It uses the same `claude` binary the session
-   was running, or the newest copy bundled with the Claude app if that one has since
-   been updated away.
-4. When that finishes, the Mac is allowed to sleep again. If it hits
-   the limit again (e.g. the weekly limit), it repeats, up to 3 times.
+1. The session stops caffeinate, turns sleep back on, and the status window shows when
+   it will wake. The reset time comes from Claude Code's record of a hard limit. After a
+   wrap-up there's no recorded reset time, so the script sends one tiny request
+   (`claude -p --no-session-persistence`, saved to no session). While the limit is in
+   effect the request is rejected without using any of your usage, and the reply says
+   when it resets.
+2. **After a hard limit**, it schedules a wake (`pmset schedule wake`) for **3 minutes
+   before the reset**, then keeps the Mac awake until **15 minutes after** it, waiting for
+   **Claude Code's own Automatic continue**. That carries on inside the desktop app, so
+   the work shows up live there. It can take about 10 minutes after the reset to kick in,
+   and it gives up if the Mac was asleep when the limit reset, which is why the script
+   wakes it first. If the app continues, the script just keeps the Mac awake for that turn.
+3. **After a wrap-up**, the app doesn't continue on its own, so the script wakes the Mac
+   90 seconds after the reset and goes straight to the background resume.
+4. The background resume (also used if the app hasn't continued 15 minutes after a hard
+   limit, or reports that it gave up) runs
+   `claude -p --resume <session> --permission-mode <the session's current mode>` with the
+   prompt *"Your usage limit has reset. Continue the task…"*. Its output is saved to
+   `~/.claude/caffeinate/<session-id>.resume.out`. It uses the same `claude` binary the
+   session was running, or the newest copy bundled with the Claude app if that one has
+   since been updated away.
+5. When that finishes, the Mac is allowed to sleep again. If it hits the limit again
+   (e.g. the weekly limit), it repeats, up to 3 times.
+
+**Plan mode:** a session in plan mode is never resumed in the background, since nothing
+can get past plan approval without you. After a hard limit the app's own continue still
+gets its chance (it shows the plan for your approval in the app). After a wrap-up the
+Mac isn't woken for it at all, and the log says to continue it yourself after the reset.
+The mode is tracked as it changes, so a session whose plan you approved counts as
+whatever mode it switched to.
+
+The log (`~/.claude/caffeinate/log.txt`) says which one happened: "Claude continued in
+the app", "the app didn't continue within 15 min of the reset" followed by the resume,
+or the plan-mode message, along with Claude Code's own `quota_auto_resume_*` events.
 
 Ways it's cancelled:
 - You type into the session yourself before the reset. You've taken over, so the
@@ -148,8 +167,12 @@ mode nobody is there to click Allow, so tools that need approval are denied and 
 stop and say what it needed. For unattended work, run the session in `acceptEdits` or
 `auto` mode.
 
-**Where to see what it did:** the resumed work runs as a separate `claude` process on the
-same session, so the desktop app won't show it live. Reopen the session afterwards, or run
+**After a background resume:** that work runs as a separate `claude` process on the same
+session. The desktop app keeps its own copy of an open session and has no way for another
+program to refresh it, so it won't show that work until you reopen the session (quitting
+and reopening the app does it). Do that before typing in the session again; otherwise the
+app continues from its older copy and Claude won't know what the background run did.
+To look without the app, run
 `claude --resume <session-id>`.
 
 **Test that waking works on your Mac.** macOS decides how a lid-closed, on-battery wake
